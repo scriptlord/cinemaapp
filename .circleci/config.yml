@@ -1,43 +1,155 @@
 version: 2.1
 
-# Define reusable orbs (if needed)
 orbs:
-  node: circleci/node@4.1.0
+  slack: circleci/slack@4.5.0
+
+executors:
+  node:
+    docker:
+      - image: circleci/node:14
+
+  aws:
+    docker:
+      - image: circleci/python:3.8
 
 jobs:
   build:
-    docker:
-      - image: cimg/node:14.17  # Use an appropriate Docker image
-
-    environment:
-      # Set any environment variables
-      CUSTOM_ENV_VAR: "my-value"
-
+    executor: node
+    working_directory: ~/my-project
     steps:
-      - checkout  # Step to check out source code
-
-      - restore_cache:  # Step to restore cache
+      - checkout
+      - run:
+          name: Print Branch Name
+          command: echo "Building on branch"
+      - restore_cache:
           keys:
-            - node-dependencies-{{ checksum "package-lock.json" }}
-            # You can specify more fallback keys
-
+            - v1-dependencies-{{ checksum "package-lock.json" }}
+            - v1-dependencies-
       - run:
-          name: Install Dependencies
+          name: Install dependencies
           command: npm install
-
-      - save_cache:  # Step to save cache after successful npm install
+      - save_cache:
           paths:
-            - ./node_modules
-          key: node-dependencies-{{ checksum "package-lock.json" }}
-
+            - node_modules
+          key: v1-dependencies-{{ checksum "package-lock.json" }}
       - run:
-          name: Additional Commands
+          name: Build the project
+          command: npm run build
+      - save_cache:
+          paths:
+            - build
+          key: v1-build-{{ checksum "src/**/*" }}
+
+  deploy_to_s3:
+    executor: aws
+    working_directory: ~/my-project
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "package-lock.json" }}
+            - v1-dependencies-
+      - restore_cache:
+          keys:
+            - v1-build-{{ checksum "src/**/*" }}
+      - run:
+          name: Install AWS CLI
           command: |
-            echo "You can run additional commands here"
-            # Add more commands as needed
+            sudo apt-get update
+            sudo apt-get install -y awscli
+      - run:
+          name: Deploy to S3
+          command: |
+            if [ "$CIRCLE_BRANCH" == "master" ]; then
+              BUCKET=$PROD_S3_BUCKET
+            elif [ "$CIRCLE_BRANCH" == "staging" ]; then
+              BUCKET=$STAGING_S3_BUCKET
+            else
+              BUCKET=$DEV_S3_BUCKET
+            fi
+            aws s3 sync ./build s3://$BUCKET --delete
+
+  invalidate_cloudfront:
+    executor: aws
+    working_directory: ~/my-project
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "package-lock.json" }}
+            - v1-dependencies-
+      - restore_cache:
+          keys:
+            - v1-build-{{ checksum "src/**/*" }}
+      - run:
+          name: Install AWS CLI
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y awscli
+      - run:
+          name: Invalidate CloudFront
+          command: |
+            if [ "$CIRCLE_BRANCH" == "main" ]; then
+              DISTRIBUTION_ID=$PROD_CLOUDFRONT_DIST_ID
+            elif [ "$CIRCLE_BRANCH" == "staging" ]; then
+              DISTRIBUTION_ID=$STAGING_CLOUDFRONT_DIST_ID
+            else
+              DISTRIBUTION_ID=$DEV_CLOUDFRONT_DIST_ID
+            fi
+            aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*"
 
 workflows:
   version: 2
-  build_and_test:
+  deploy-development:
     jobs:
       - build
+      - deploy_to_s3:
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - development
+      - invalidate_cloudfront:
+          requires:
+            - deploy_to_s3
+          filters:
+            branches:
+              only:
+                - development
+
+  deploy-staging:
+    jobs:
+      - build
+      - deploy_to_s3:
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - staging
+      - invalidate_cloudfront:
+          requires:
+            - deploy_to_s3
+          filters:
+            branches:
+              only:
+                - staging
+
+  deploy-production:
+    jobs:
+      - build
+      - deploy_to_s3:
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - main
+      - invalidate_cloudfront:
+          requires:
+            - deploy_to_s3
+          filters:
+            branches:
+              only:
+                - main
